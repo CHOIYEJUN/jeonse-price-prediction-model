@@ -55,11 +55,11 @@ YEAR_WEIGHTS = {
     2025: 1.0,
     2024: 1.0,
     2023: 1.0,
-    2022: 1.0,
-    2021: 1.0,
-    2020: 1.0,
+    2022: 0.6,
+    2021: 0.5,
+    2020: 0.4,
 }
-DEFAULT_YEAR_WEIGHT = 1.0
+DEFAULT_YEAR_WEIGHT = 0.4
 
 # 1차 학습 후 상위 K개 피처만 골라 재학습
 TOP_K_FEATURES_FOR_RETRAIN = 50
@@ -71,9 +71,9 @@ TOP_K_FEATURES_FOR_RETRAIN = 50
 OUTLIER_FILTER_MODE = "percentile"  # "bounds" | "percentile"
 # bounds 모드: 이 구간 밖은 제거
 JEONSE_RATIO_MIN = 0.25   # 25% 미만 제거 (매우 저렴한 전세 = 의심 거래)
-JEONSE_RATIO_MAX = 0.9    # 90% 초과 제거
+JEONSE_RATIO_MAX = 0.90    # 90% 초과 제거
 # percentile 모드: 하위/상위 이 비율만큼 제거
-OUTLIER_PERCENTILE_LOW = 10   
+OUTLIER_PERCENTILE_LOW = 20   
 OUTLIER_PERCENTILE_HIGH = 10  
 
 

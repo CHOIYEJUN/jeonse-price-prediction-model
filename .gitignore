@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+.AppleDouble
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# 학습 원본 데이터 (용량 크고 민감)
+data/
+dataset/
+
+# 백업 폴더
+백업/
