@@ -1,8 +1,10 @@
 """
 아파트 전세비율(jeonseRatio) 예측용 XGBoost 회귀 모델 학습.
-시점 기반 분할, 원핫 인코딩 사용, 모델은 model/xgboost_jeonse_model.pkl 로 저장.
+eval: train ≤ 2025 / val 2026 H1 / test 2026 H2
+production: 전 기간 재학습 후 모델 저장 (공식 성능은 eval만 사용)
 """
 
+import argparse
 import os
 import time
 import threading
@@ -31,7 +33,6 @@ MODEL_PATH = os.path.join(MODEL_DIR, "xgboost_jeonse_model.pkl")
 # ---------------------------------------------------------------------------
 # XGBoost 하이퍼파라미터
 # ---------------------------------------------------------------------------
-# 20회 랜덤 탐색으로 선정 (Test MAPE 8.78% 기준 최적)
 XGB_PARAMS = {
     "n_estimators": 400,
     "max_depth": 6,
@@ -48,37 +49,45 @@ PROGRESS_LOG_INTERVAL_SEC = 10.0
 MIN_SAMPLES_FOR_CATEGORY = 15
 EARLY_STOPPING_ROUNDS = 50
 
-# ---------------------------------------------------------------------------
-# 연도별 학습 가중치
-# ---------------------------------------------------------------------------
-YEAR_WEIGHTS = {
+TRAIN_YM_MAX = 202512
+VAL_YM_MIN = 202601
+VAL_YM_MAX = 202606
+TEST_YM_MIN = 202607
+
+# eval 학습에 실제로 들어가는 연도 가중치 (2026은 eval에 없음)
+EVAL_YEAR_WEIGHTS = {
     2025: 1.0,
-    2024: 1.0,
-    2023: 1.0,
+    2024: 0.8,
+    2023: 0.7,
+    2022: 0.6,
+    2021: 0.5,
+    2020: 0.4,
+}
+
+# production은 최신 연도 가중치 최대
+PROD_YEAR_WEIGHTS = {
+    2026: 1.0,
+    2025: 0.9,
+    2024: 0.8,
+    2023: 0.7,
     2022: 0.6,
     2021: 0.5,
     2020: 0.4,
 }
 DEFAULT_YEAR_WEIGHT = 0.4
 
-# 1차 학습 후 상위 K개 피처만 골라 재학습
-TOP_K_FEATURES_FOR_RETRAIN = 50
+TOP_K_FEATURES_FOR_RETRAIN = 100
 
-# ---------------------------------------------------------------------------
-# 전세비율(jeonseRatio) 이상치 제거 — 허수/비정상 거래(지인 거래 등) 제외
-# ---------------------------------------------------------------------------
-# 모드: "bounds" = 고정 구간, "percentile" = 하위/상위 N% 제거
 OUTLIER_FILTER_MODE = "percentile"  # "bounds" | "percentile"
-# bounds 모드: 이 구간 밖은 제거
-JEONSE_RATIO_MIN = 0.25   # 25% 미만 제거 (매우 저렴한 전세 = 의심 거래)
-JEONSE_RATIO_MAX = 0.90    # 90% 초과 제거
-# percentile 모드: 하위/상위 이 비율만큼 제거
-OUTLIER_PERCENTILE_LOW = 20   
-OUTLIER_PERCENTILE_HIGH = 10  
+JEONSE_RATIO_MIN = 0.10
+JEONSE_RATIO_MAX = 0.95
+OUTLIER_PERCENTILE_LOW = 10
+OUTLIER_PERCENTILE_HIGH = 5
+
+DUMMY_PREFIXES = ("apartmentName_", "dong_", "region_")
 
 
 def _progress_logger(interval_sec: float, stop_event: threading.Event) -> None:
-    """일정 간격으로 학습 진행 로그를 출력."""
     start = time.perf_counter()
     while not stop_event.is_set():
         stop_event.wait(interval_sec)
@@ -88,106 +97,187 @@ def _progress_logger(interval_sec: float, stop_event: threading.Event) -> None:
         print(f"  진행 중: 학습 {elapsed}초 경과")
 
 
-def run_training(xgb_params=None, verbose=True):
+def _price_mape(actual, predicted):
+    nonzero = actual != 0
+    if nonzero.sum() == 0:
+        return float("nan")
+    a = actual[nonzero]
+    p = predicted[nonzero]
+    return (np.abs(a - p) / a).mean() * 100
+
+
+def _fit_xgb(params, X_train, y_train, sample_weight, X_val=None, y_val=None):
+    model = xgb.XGBRegressor(**params)
+    fit_kwargs = {
+        "sample_weight": sample_weight,
+    }
+    try:
+        if X_val is not None and y_val is not None and len(X_val) > 0:
+            model.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+                verbose=False,
+                **fit_kwargs,
+            )
+        else:
+            model.fit(X_train, y_train, verbose=False, **fit_kwargs)
+    except TypeError:
+        model.fit(X_train, y_train, sample_weight=sample_weight)
+    return model
+
+
+def _eval_price_metrics(model, X, df_rows):
+    predicted_ratio = model.predict(X)
+    sale_price = df_rows["salePrice"].values
+    predicted = predicted_ratio * sale_price
+    actual = df_rows["jeonsePrice"].values
+    mae = mean_absolute_error(actual, predicted)
+    rmse = float(np.sqrt(mean_squared_error(actual, predicted)))
+    mape = _price_mape(actual, predicted)
+    return {
+        "mae": mae,
+        "rmse": rmse,
+        "mape": mape,
+        "predicted": predicted,
+        "actual": actual,
+    }
+
+
+def run_training(xgb_params=None, verbose=True, mode="eval"):
     """
     데이터 로드·전처리·학습·평가까지 수행.
-    xgb_params: None이면 XGB_PARAMS 사용. 반환: dict(mape, mae, rmse, model, feature_cols, params)
+    mode: "eval" | "production"
     """
+    if mode not in ("eval", "production"):
+        raise ValueError("mode must be 'eval' or 'production'")
+
     params = dict(XGB_PARAMS) if xgb_params is None else dict(xgb_params)
     params.setdefault("random_state", 42)
+    year_weights = EVAL_YEAR_WEIGHTS if mode == "eval" else PROD_YEAR_WEIGHTS
 
-    # -----------------------------------------------------------------------
-    # STEP 1 — 데이터셋 로드
-    # -----------------------------------------------------------------------
     df = pd.read_csv(DATASET_PATH)
 
     if "last_jeonse_ratio" in df.columns:
         df = df.dropna(subset=["last_jeonse_ratio"]).copy()
 
-    if "jeonseRatio" in df.columns:
-        if OUTLIER_FILTER_MODE == "bounds":
-            keep = (df["jeonseRatio"] >= JEONSE_RATIO_MIN) & (df["jeonseRatio"] <= JEONSE_RATIO_MAX)
-            n_removed = (~keep).sum()
-            if verbose:
-                print(f"전세비율 이상치 제거 (bounds): jeonseRatio [{JEONSE_RATIO_MIN}, {JEONSE_RATIO_MAX}] 밖 {n_removed}건 제거")
+    if "jeonseYm" not in df.columns:
+        raise ValueError("dataset에 jeonseYm이 없습니다. build_dataset.py를 다시 실행하세요.")
+
+    df["jeonseYm"] = pd.to_numeric(df["jeonseYm"], errors="coerce")
+    df = df.dropna(subset=["jeonseYm", "jeonseRatio", "salePrice", "jeonsePrice"]).copy()
+    df["jeonseYm"] = df["jeonseYm"].astype(int)
+
+    if mode == "eval":
+        train_mask = df["jeonseYm"] <= TRAIN_YM_MAX
+        val_mask = (df["jeonseYm"] >= VAL_YM_MIN) & (df["jeonseYm"] <= VAL_YM_MAX)
+        test_mask = df["jeonseYm"] >= TEST_YM_MIN
+    else:
+        train_mask = pd.Series(True, index=df.index)
+        val_mask = pd.Series(False, index=df.index)
+        test_mask = pd.Series(False, index=df.index)
+
+    if verbose:
+        if mode == "eval":
+            print(
+                "시점 분할: "
+                f"train jeonseYm ≤ {TRAIN_YM_MAX} / "
+                f"val {VAL_YM_MIN}–{VAL_YM_MAX} / "
+                f"test ≥ {TEST_YM_MIN}"
+            )
+            print(
+                f"분할 행 수(필터 전): train={int(train_mask.sum())} "
+                f"val={int(val_mask.sum())} test={int(test_mask.sum())}"
+            )
         else:
-            low_q = np.percentile(df["jeonseRatio"], OUTLIER_PERCENTILE_LOW)
-            high_q = np.percentile(df["jeonseRatio"], 100 - OUTLIER_PERCENTILE_HIGH)
-            keep = (df["jeonseRatio"] >= low_q) & (df["jeonseRatio"] <= high_q)
-            n_removed = (~keep).sum()
+            print(f"production 모드: 전 기간 학습 n={len(df)} (공식 성능은 eval 모드만 사용)")
+
+    if "jeonseRatio" in df.columns:
+        train_ratio = df.loc[train_mask, "jeonseRatio"]
+        if OUTLIER_FILTER_MODE == "bounds":
+            low_q, high_q = JEONSE_RATIO_MIN, JEONSE_RATIO_MAX
             if verbose:
-                print(f"전세비율 이상치 제거 (percentile): 하위 {OUTLIER_PERCENTILE_LOW}%·상위 {OUTLIER_PERCENTILE_HIGH}% 제거, {n_removed}건 제거 (유효 구간 [{low_q:.3f}, {high_q:.3f}])")
+                print(
+                    f"전세비율 이상치 제거 (bounds, train 기준): "
+                    f"jeonseRatio [{low_q}, {high_q}] 밖 제거"
+                )
+        else:
+            low_q = np.percentile(train_ratio, OUTLIER_PERCENTILE_LOW)
+            high_q = np.percentile(train_ratio, 100 - OUTLIER_PERCENTILE_HIGH)
+            if verbose:
+                print(
+                    f"전세비율 이상치 제거 (percentile, train 기준): "
+                    f"하위 {OUTLIER_PERCENTILE_LOW}%·상위 {OUTLIER_PERCENTILE_HIGH}% "
+                    f"유효 구간 [{low_q:.3f}, {high_q:.3f}]"
+                )
+        keep = (df["jeonseRatio"] >= low_q) & (df["jeonseRatio"] <= high_q)
+        n_removed = int((~keep).sum())
+        if verbose:
+            print(f"이상치 제거: {n_removed}건")
         df = df.loc[keep].copy()
+        train_mask = train_mask.loc[keep]
+        val_mask = val_mask.loc[keep]
+        test_mask = test_mask.loc[keep]
 
     df_original = df.copy()
 
-    # -----------------------------------------------------------------------
-    # STEP 2 — 희귀 단지/동은 "기타"로 묶은 뒤 원핫 인코딩
-    # -----------------------------------------------------------------------
-    for col in ["apartmentName", "dong"]:
-        counts = df[col].value_counts()
-        rare = counts[counts < MIN_SAMPLES_FOR_CATEGORY].index.tolist()
-        if rare:
-            df.loc[df[col].isin(rare), col] = "기타"
+    dummy_cols = [c for c in ["apartmentName", "dong", "region"] if c in df.columns]
+    for col in dummy_cols:
+        counts = df.loc[train_mask, col].value_counts()
+        keep_vals = set(counts[counts >= MIN_SAMPLES_FOR_CATEGORY].index.tolist())
+        df[col] = df[col].where(df[col].isin(keep_vals), "기타")
 
-    dummy_cols = ["apartmentName", "dong"]
-    if "region" in df.columns:
-        dummy_cols.append("region")
+    df_encoded = pd.get_dummies(df, columns=dummy_cols)
+    dummy_feature_cols = [
+        c for c in df_encoded.columns if c.startswith(DUMMY_PREFIXES)
+    ]
+    train_dummy_cols = [
+        c for c in dummy_feature_cols if df_encoded.loc[train_mask, c].sum() > 0
+    ]
 
-    df = pd.get_dummies(df, columns=dummy_cols)
-
-    # -----------------------------------------------------------------------
-    # STEP 3 — 피처 선택
-    # -----------------------------------------------------------------------
     numeric_features = [
         "area",
         "floor",
         "buildingAge",
         "salePrice",
         "price_per_m2",
-        "match_gap_year",
         "last_jeonse_ratio",
     ]
-    for col in ("price_percentile_in_dong", "last_3_mean_jeonse_ratio"):
-        if col in df.columns:
+    for col in (
+        "match_gap_days",
+        "match_gap_year",
+        "price_percentile_in_dong",
+        "last_3_mean_jeonse_ratio",
+        "saleYear",
+    ):
+        if col in df_encoded.columns:
             numeric_features.append(col)
 
-    if "saleYear" in df.columns:
-        numeric_features.append("saleYear")
-
-    encoded_apt = [c for c in df.columns if c.startswith("apartmentName_")]
-    encoded_dong = [c for c in df.columns if c.startswith("dong_")]
-    encoded_region = [c for c in df.columns if c.startswith("region_")]
-
-    feature_cols = numeric_features + encoded_apt + encoded_dong + encoded_region
+    feature_cols = numeric_features + train_dummy_cols
     target_col = "jeonseRatio"
 
-    X = df[feature_cols]
-    y = df[target_col]
-
-    # -----------------------------------------------------------------------
-    # STEP 4 — 연도 기준 학습/검증/테스트 분할
-    # -----------------------------------------------------------------------
-    train_mask = df["year"] <= 2023
-    val_mask = df["year"] == 2024
-    test_mask = df["year"] == 2025
+    X = df_encoded[feature_cols]
+    y = df_encoded[target_col]
 
     X_train, y_train = X[train_mask], y[train_mask]
     X_val, y_val = X[val_mask], y[val_mask]
     X_test, y_test = X[test_mask], y[test_mask]
+    df_val = df_original[val_mask].copy()
     df_test = df_original[test_mask].copy()
 
-    train_years = df.loc[train_mask, "year"].astype(int)
+    if len(X_train) == 0:
+        raise ValueError("학습 데이터가 비었습니다.")
+
+    train_years = df_encoded.loc[train_mask, "year"].astype(int)
     sample_weight = np.array(
-        [YEAR_WEIGHTS.get(int(year_value), DEFAULT_YEAR_WEIGHT) for year_value in train_years]
+        [year_weights.get(int(year_value), DEFAULT_YEAR_WEIGHT) for year_value in train_years]
     )
 
     if verbose:
-        print("연도별 학습 가중치:", YEAR_WEIGHTS, f"(default={DEFAULT_YEAR_WEIGHT})")
+        print("연도별 학습 가중치:", year_weights, f"(default={DEFAULT_YEAR_WEIGHT})")
+        print(f"학습 행 수(필터 후): train={len(X_train)} val={len(X_val)} test={len(X_test)}")
 
-    # -----------------------------------------------------------------------
-    # STEP 5 — XGBoost 1차 학습
-    # -----------------------------------------------------------------------
     if verbose:
         print("XGBoost 1차 학습 시작 (전체 피처)...")
     stop_event = threading.Event()
@@ -199,18 +289,14 @@ def run_training(xgb_params=None, verbose=True):
     progress_thread.start()
 
     try:
-        model = xgb.XGBRegressor(**params)
-        try:
-            model.fit(
-                X_train,
-                y_train,
-                sample_weight=sample_weight,
-                eval_set=[(X_val, y_val)],
-                early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-                verbose=False,
-            )
-        except TypeError:
-            model.fit(X_train, y_train, sample_weight=sample_weight)
+        model = _fit_xgb(
+            params,
+            X_train,
+            y_train,
+            sample_weight,
+            X_val if mode == "eval" and len(X_val) > 0 else None,
+            y_val if mode == "eval" and len(X_val) > 0 else None,
+        )
     finally:
         stop_event.set()
         progress_thread.join(timeout=PROGRESS_LOG_INTERVAL_SEC + 1)
@@ -218,9 +304,6 @@ def run_training(xgb_params=None, verbose=True):
     if verbose:
         print("1차 학습 완료.")
 
-    # -----------------------------------------------------------------------
-    # STEP 6 — 피처 중요도 계산 후 상위 K개로 재학습
-    # -----------------------------------------------------------------------
     importance = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=False)
 
     if verbose:
@@ -229,103 +312,100 @@ def run_training(xgb_params=None, verbose=True):
 
     if TOP_K_FEATURES_FOR_RETRAIN > 0 and len(feature_cols) > TOP_K_FEATURES_FOR_RETRAIN:
         top_cols = importance.head(TOP_K_FEATURES_FOR_RETRAIN).index.tolist()
-
         X_train_k = X_train[top_cols]
-        X_val_k = X_val[top_cols]
-        X_test_k = X_test[top_cols]
+        X_val_k = X_val[top_cols] if len(X_val) else X_val
+        X_test_k = X_test[top_cols] if len(X_test) else X_test
 
         if verbose:
             print(f"\n상위 {TOP_K_FEATURES_FOR_RETRAIN}개 피처로 재학습...")
 
-        model2 = xgb.XGBRegressor(**params)
-        try:
-            model2.fit(
-                X_train_k,
-                y_train,
-                sample_weight=sample_weight,
-                eval_set=[(X_val_k, y_val)],
-                early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-                verbose=False,
-            )
-        except TypeError:
-            model2.fit(X_train_k, y_train, sample_weight=sample_weight)
-
-        model = model2
+        model = _fit_xgb(
+            params,
+            X_train_k,
+            y_train,
+            sample_weight,
+            X_val_k if mode == "eval" and len(X_val_k) > 0 else None,
+            y_val if mode == "eval" and len(X_val_k) > 0 else None,
+        )
         feature_cols = top_cols
+        X_val = X_val_k
         X_test = X_test_k
-
         if verbose:
             print("재학습 완료.")
 
-    # -----------------------------------------------------------------------
-    # STEP 7 — 전세비율 예측 후 전세가로 환산
-    # -----------------------------------------------------------------------
-    predicted_ratio = model.predict(X_test)
-    sale_price_test = df_test["salePrice"].values
-    predicted_jeonse_price = predicted_ratio * sale_price_test
-    actual_jeonse_price = df_test["jeonsePrice"].values
+    val_metrics = {"mape": float("nan"), "mae": float("nan"), "rmse": float("nan")}
+    test_metrics = {"mape": float("nan"), "mae": float("nan"), "rmse": float("nan")}
 
-    # -----------------------------------------------------------------------
-    # STEP 8 — 평가
-    # -----------------------------------------------------------------------
-    mae = mean_absolute_error(actual_jeonse_price, predicted_jeonse_price)
-    rmse = np.sqrt(mean_squared_error(actual_jeonse_price, predicted_jeonse_price))
+    if mode == "eval":
+        if len(X_val) > 0:
+            val_metrics = _eval_price_metrics(model, X_val, df_val)
+        if len(X_test) > 0:
+            test_metrics = _eval_price_metrics(model, X_test, df_test)
 
-    nonzero_mask = actual_jeonse_price != 0
-    safe_actual = actual_jeonse_price[nonzero_mask]
-    safe_pred = predicted_jeonse_price[nonzero_mask]
+        if verbose:
+            print("\nVal MAE:", val_metrics["mae"])
+            print("Val RMSE:", val_metrics["rmse"])
+            print("Val MAPE:", val_metrics["mape"])
+            print("\nTest MAE:", test_metrics["mae"])
+            print("Test RMSE:", test_metrics["rmse"])
+            print("Test MAPE:", test_metrics["mape"])
 
-    mape = (
-        (np.abs(safe_actual - safe_pred) / safe_actual).mean() * 100
-        if len(safe_actual) > 0
-        else float("nan")
-    )
+            if len(X_test) > 0:
+                actual = test_metrics["actual"]
+                predicted = test_metrics["predicted"]
+                bands = [(0, 50000, "0~5억"), (50000, 10**9, "5억 이상")]
+                print("\n가격대별 MAPE (만원 기준, Test):")
+                for low, high, label in bands:
+                    mask = (actual >= low) & (actual < high)
+                    if mask.sum() == 0:
+                        continue
+                    band_mape = _price_mape(actual[mask], predicted[mask])
+                    print(f"  {label}: MAPE={band_mape:.2f}% (n={int(mask.sum())})")
 
-    if verbose:
-        print("\nTest MAE:", mae)
-        print("Test RMSE:", rmse)
-        print("Test MAPE:", mape)
+                nonzero = actual != 0
+                ratio_errors = (np.abs(actual[nonzero] - predicted[nonzero]) / actual[nonzero]) * 100
+                print("\n오차 분포 (Test)")
+                print("median MAPE:", np.median(ratio_errors))
+                print("p75:", np.percentile(ratio_errors, 75))
+                print("p90:", np.percentile(ratio_errors, 90))
+                print("p95:", np.percentile(ratio_errors, 95))
+                print("max:", np.max(ratio_errors))
 
-        bands = [(0, 50000, "0~5억"), (50000, 10**9, "5억 이상")]
-        print("\n가격대별 MAPE (만원 기준):")
-        for low, high, label in bands:
-            mask = (actual_jeonse_price >= low) & (actual_jeonse_price < high)
-            if mask.sum() == 0:
-                continue
-            a = actual_jeonse_price[mask]
-            p = predicted_jeonse_price[mask]
-            nz = a != 0
-            if nz.sum() > 0:
-                band_mape = (np.abs(a[nz] - p[nz]) / a[nz]).mean() * 100
-                print(f"  {label}: MAPE={band_mape:.2f}% (n={mask.sum()})")
-
-        ratio_errors = (np.abs(safe_actual - safe_pred) / safe_actual) * 100
-        print("\n오차 분포")
-        print("median MAPE:", np.median(ratio_errors))
-        print("p75:", np.percentile(ratio_errors, 75))
-        print("p90:", np.percentile(ratio_errors, 90))
-        print("p95:", np.percentile(ratio_errors, 95))
-        print("max:", np.max(ratio_errors))
-
-        df_test = df_test.loc[nonzero_mask].copy()
-        df_test["predicted"] = safe_pred
-        df_test["error_pct"] = ratio_errors
-        worst = df_test.sort_values("error_pct", ascending=False).head(20).reset_index(drop=True)
-        print("\nWorst predictions")
-        print(worst[["salePrice", "jeonsePrice", "predicted", "error_pct"]])
+                df_test_out = df_test.loc[nonzero].copy()
+                df_test_out["predicted"] = predicted[nonzero]
+                df_test_out["error_pct"] = ratio_errors
+                worst = df_test_out.sort_values("error_pct", ascending=False).head(20).reset_index(drop=True)
+                print("\nWorst predictions")
+                cols = ["salePrice", "jeonsePrice", "predicted", "error_pct"]
+                if "jeonseYm" in worst.columns:
+                    cols = ["jeonseYm"] + cols
+                print(worst[cols])
+    elif verbose:
+        print("\nproduction 모드는 Test MAPE를 출력하지 않습니다. 공식 성능은 eval 모드를 사용하세요.")
 
     return {
-        "mape": mape,
-        "mae": mae,
-        "rmse": rmse,
+        "mape": test_metrics["mape"],
+        "val_mape": val_metrics["mape"],
+        "mae": test_metrics["mae"],
+        "rmse": test_metrics["rmse"],
         "model": model,
         "feature_cols": feature_cols,
         "params": params,
+        "mode": mode,
     }
 
 
 def main() -> None:
-    result = run_training(xgb_params=None, verbose=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=["eval", "production"],
+        default="eval",
+        help="eval: 시점 홀드아웃 평가 / production: 전 기간 재학습 후 저장",
+    )
+    args = parser.parse_args()
+
+    result = run_training(xgb_params=None, verbose=True, mode=args.mode)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     joblib.dump(result["model"], MODEL_PATH)
@@ -333,6 +413,7 @@ def main() -> None:
 
     print(f"\n모델 저장 경로: {MODEL_PATH}")
     print(f"사용 피처 수: {len(result['feature_cols'])}")
+    print(f"mode: {args.mode}")
 
 
 if __name__ == "__main__":
