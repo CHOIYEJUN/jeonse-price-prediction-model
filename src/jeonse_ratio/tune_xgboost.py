@@ -105,7 +105,7 @@ def main():
     joblib.dump(best_result["model"], MODEL_PATH)
     joblib.dump(best_result["feature_cols"], os.path.join(MODEL_DIR, "xgboost_feature_cols.pkl"))
     print(f"\n최적(eval) 모델 저장: {MODEL_PATH}")
-    print("배포 모델은 training/train_xgboost.py --mode production 으로 다시 학습하세요.")
+    print("배포 모델은 src/jeonse_ratio/train_xgboost.py --mode production 으로 다시 학습하세요.")
 
     print("\n--- train_xgboost.py 에 넣을 XGB_PARAMS (복사용) ---")
     print("XGB_PARAMS = {")

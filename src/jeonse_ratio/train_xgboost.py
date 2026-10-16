@@ -28,8 +28,8 @@ except Exception as e:
 # ---------------------------------------------------------------------------
 # 경로
 # ---------------------------------------------------------------------------
-# __file__ = 이 파일 경로. 상위 폴더가 training, 그 위가 프로젝트 루트
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# __file__ = src/jeonse_ratio/ 안. 프로젝트 루트는 세 단계 위
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATASET_PATH = os.path.join(PROJECT_ROOT, "dataset", "merged_dataset.csv")
 MODEL_DIR = os.path.join(PROJECT_ROOT, "model")
 MODEL_PATH = os.path.join(MODEL_DIR, "xgboost_jeonse_model.pkl")

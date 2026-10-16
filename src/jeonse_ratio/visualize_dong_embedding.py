@@ -14,8 +14,8 @@ import torch
 
 from embedding_mlp_model import JeonseEmbeddingMLP
 
-# __file__: 이 스크립트 경로. 상위 두 칸이 프로젝트 루트다.
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# __file__: src/jeonse_ratio/ 안. 프로젝트 루트는 세 단계 위다.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODEL_DIR = os.path.join(PROJECT_ROOT, "model")
 MODEL_PATH = os.path.join(MODEL_DIR, "embedding_mlp_model.pt")
 MAPPING_PATH = os.path.join(MODEL_DIR, "embedding_category_mapping.pkl")
@@ -73,7 +73,7 @@ def reduce_2d(vectors: np.ndarray) -> np.ndarray:
 def main() -> None:
     """저장해 둔 MLP에서 동 임베딩을 꺼내 산점도를 그린다."""
     if not os.path.exists(MODEL_PATH) or not os.path.exists(MAPPING_PATH):
-        print("먼저 training/train_embedding_mlp.py 를 실행하세요.")
+        print("먼저 src/jeonse_ratio/train_embedding_mlp.py 를 실행하세요.")
         sys.exit(1)
 
     # mapping: 동 이름 ↔ 인덱스, 숫자 피처 목록, 스케일러 등이 들어 있는 사전

@@ -16,10 +16,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-_ROOT = Path(__file__).resolve().parent.parent
+_HERE = Path(__file__).resolve().parent
+_ROOT = _HERE.parent.parent
 _MODEL_DIR = _ROOT / "model"
-# training/ 안의 JeonseEmbeddingMLP 클래스를 그대로 쓴다
-sys.path.insert(0, str(_ROOT / "training"))
+# 같은 폴더의 JeonseEmbeddingMLP 클래스를 그대로 쓴다
+sys.path.insert(0, str(_HERE))
 from embedding_mlp_model import JeonseEmbeddingMLP  # noqa: E402
 
 UNKNOWN_IDX = 0
@@ -42,7 +43,7 @@ _CKPT_PATH = _MODEL_DIR / "embedding_mlp_model.pt"
 if not _MAPPING_PATH.exists() or not _CKPT_PATH.exists():
     raise RuntimeError(
         "임베딩 모형 파일이 없습니다. "
-        "training/train_embedding_mlp.py 를 먼저 실행하세요."
+        "src/jeonse_ratio/train_embedding_mlp.py 를 먼저 실행하세요."
     )
 
 # mapping: 단지/동 이름 → 인덱스, 숫자 열 목록, StandardScaler

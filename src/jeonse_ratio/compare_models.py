@@ -26,12 +26,12 @@ from train_xgboost import MODEL_PATH as XGB_MODEL_PATH
 
 # 프로젝트 루트/model 아래의 MLP 산출물
 MLP_MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "model",
     "embedding_mlp_model.pt",
 )
 MLP_MAPPING_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "model",
     "embedding_category_mapping.pkl",
 )

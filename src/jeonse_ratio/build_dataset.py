@@ -15,8 +15,8 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # 경로
 # ---------------------------------------------------------------------------
-# __file__ = 이 스크립트 위치. dirname 두 번이면 프로젝트 루트
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# __file__ = src/jeonse_ratio/ 안. dirname 세 번이면 프로젝트 루트
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_RAW_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
 DATA_ROW_DIR = os.path.join(PROJECT_ROOT, "data", "row")  # 예전 폴더 이름 호환
 DATASET_DIR = os.path.join(PROJECT_ROOT, "dataset")

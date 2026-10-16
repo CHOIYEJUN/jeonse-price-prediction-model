@@ -23,7 +23,7 @@ from embedding_mlp_model import JeonseEmbeddingMLP
 # ---------------------------------------------------------------------------
 # 경로
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATASET_PATH = os.path.join(PROJECT_ROOT, "dataset", "merged_dataset.csv")
 MODEL_DIR = os.path.join(PROJECT_ROOT, "model")
 MODEL_PATH = os.path.join(MODEL_DIR, "embedding_mlp_model.pt")
